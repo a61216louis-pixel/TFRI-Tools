@@ -18,9 +18,21 @@ options(shiny.maxRequestSize = 500 * 1024^2)
 
 TAX_COLS <- c("OTU_ID", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
 
+# 解析 Block 對應字串，例如 "1,2;3" -> Block1 = R1,R2；Block2 = R3
+# 回傳具名向量：names = Rep 編號，值 = Block 名稱
+parse_block_map <- function(spec) {
+  groups <- trimws(strsplit(spec, ";", fixed = TRUE)[[1]])
+  groups <- groups[groups != ""]
+  validate(need(length(groups) >= 1, "Block 對應設定不可為空，格式如：1,2;3"))
+  reps <- lapply(groups, function(g) suppressWarnings(as.integer(trimws(strsplit(g, ",", fixed = TRUE)[[1]]))))
+  validate(need(!anyNA(unlist(reps)), paste0("Block 對應設定格式錯誤（只能包含數字、逗號、分號）：", spec)))
+  validate(need(!anyDuplicated(unlist(reps)), "Block 對應設定中有 Rep 編號重複出現在多個 Block。"))
+  stats::setNames(rep(paste0("Block", seq_along(reps)), lengths(reps)), unlist(reps))
+}
+
 # 從樣本欄位名稱解析 Treatment / Rep / Subsample / Block
 # 命名規則: (CtP|Ct|NaP|Na) R <repnum> <A/B> _ ...
-parse_sample_metadata <- function(sample_cols) {
+parse_sample_metadata <- function(sample_cols, block_map) {
   pat <- "^(CtP|Ct|NaP|Na)R([0-9]+)([A-Za-z])(?:_|$)"
   m <- regexec(pat, sample_cols, perl = TRUE)
   parts <- regmatches(sample_cols, m)
@@ -43,7 +55,11 @@ parse_sample_metadata <- function(sample_cols) {
   )
   meta$Salt    <- factor(ifelse(meta$Treatment %in% c("Na", "NaP"), "Na", "Ct"), levels = c("Ct", "Na"))
   meta$Microbe <- factor(ifelse(meta$Treatment %in% c("CtP", "NaP"), "P", "NoP"), levels = c("NoP", "P"))
-  meta$Block   <- factor(ifelse(meta$RepNum %in% c(1, 2), "Block1", "Block2"), levels = c("Block1", "Block2"))
+  unmapped <- sort(unique(meta$RepNum[!as.character(meta$RepNum) %in% names(block_map)]))
+  validate(need(length(unmapped) == 0,
+                paste0("以下 Rep 編號未指定所屬 Block，請修改左側「Block 對應」設定：R",
+                       paste(unmapped, collapse = ", R"))))
+  meta$Block   <- droplevels(factor(unname(block_map[as.character(meta$RepNum)]), levels = unique(unname(block_map))))
   meta$RepID   <- paste0(meta$Treatment, "_R", meta$RepNum)  # 同一個 Rep(Tray) 的唯一識別，A/B 為其假重複
   meta
 }
@@ -92,47 +108,79 @@ compute_alpha_indices <- function(comm) {
   )
 }
 
-# LMM: value ~ Salt*Microbe + Block(固定或隨機)，回傳 ANOVA table 與模型
-# block_effect: "random" -> (1|Block) 隨機效應 (適合 Block 層級數多的情況)
-#               "fixed"  -> + Block  固定效應 (Block 層級數少，如本設計只有2個，建議用這個，避免 singular fit)
-run_lmm <- function(df, block_effect = "fixed") {
-  if (block_effect == "random") {
-    m <- tryCatch(
-      lmerTest::lmer(value ~ Salt * Microbe + (1 | Block), data = df),
-      error = function(e) e, warning = function(w) w
-    )
-  } else {
-    m <- tryCatch(
-      lm(value ~ Salt * Microbe + Block, data = df),
-      error = function(e) e
-    )
+# 執行模型配適，收集 warning 與 lme4 的 singular fit 訊息但「不中斷」配適，
+# 讓模型照常回傳，警告另外交由介面顯示（原本任何 warning 都會讓整個模型被丟棄）
+fit_collect_warnings <- function(expr) {
+  warns <- character(0)
+  value <- withCallingHandlers(
+    tryCatch(expr, error = function(e) e),
+    warning = function(w) {
+      warns <<- c(warns, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    },
+    message = function(m) {
+      if (grepl("singular", conditionMessage(m), ignore.case = TRUE)) {
+        warns <<- c(warns, trimws(conditionMessage(m)))
+        invokeRestart("muffleMessage")
+      }
+    }
+  )
+  if (inherits(value, "merMod") && lme4::isSingular(value) &&
+      !any(grepl("singular", warns, ignore.case = TRUE))) {
+    warns <- c(warns, "boundary (singular) fit：Block 隨機效應變異數估計為 0，建議改用固定效應。")
   }
-  if (inherits(m, "error") || inherits(m, "warning")) {
-    return(list(model = NULL, anova = NULL, error = conditionMessage(m)))
+  list(value = value, warnings = unique(warns))
+}
+
+# Block 只有 1 個層級時（例如稀疏化排除樣本後），模型不能放 Block 項
+has_multi_block <- function(df) nlevels(droplevels(factor(df$Block))) > 1
+
+# LMM: value ~ Block(固定或隨機) + Salt*Microbe，回傳 ANOVA table、模型與警告
+# block_effect: "random" -> (1|Block) 隨機效應 (適合 Block 層級數多的情況)
+#               "fixed"  -> Block + ... 固定效應 (Block 層級數少，如本設計只有2個，建議用這個，避免 singular fit)
+# 固定效應時 Block 放在最前面，使 anova() 的循序 (Type I) 平方和先扣除區集效應，與 PERMANOVA 一致
+run_lmm <- function(df, block_effect = "fixed") {
+  multi_block <- has_multi_block(df)
+  fit <- fit_collect_warnings(
+    if (block_effect == "random" && multi_block) {
+      lmerTest::lmer(value ~ Salt * Microbe + (1 | Block), data = df)
+    } else if (multi_block) {
+      lm(value ~ Block + Salt * Microbe, data = df)
+    } else {
+      lm(value ~ Salt * Microbe, data = df)
+    }
+  )
+  m <- fit$value
+  if (inherits(m, "error")) {
+    return(list(model = NULL, anova = NULL, error = conditionMessage(m), warnings = fit$warnings))
   }
   av <- tryCatch({
     a <- as.data.frame(anova(m))
     a$Term <- rownames(a)
     a
   }, error = function(e) NULL)
-  list(model = m, anova = av, error = NULL)
+  list(model = m, anova = av, error = NULL, warnings = fit$warnings)
 }
 
 # emmeans Tukey 事後檢定 + compact letter display（依 Treatment 四組）
 # 改用 multcompView::multcompLetters 直接從成對 P 值組字母標示，避開 multcomp::cld() 對 emmGrid 的相容性問題
 run_posthoc <- function(df, block_effect = "fixed") {
   df$Group <- interaction(df$Salt, df$Microbe, sep = "_", drop = TRUE)
+  multi_block <- has_multi_block(df)
 
-  m <- tryCatch({
-    if (block_effect == "random") {
+  fit <- fit_collect_warnings(
+    if (block_effect == "random" && multi_block) {
       lmerTest::lmer(value ~ Group + (1 | Block), data = df)
+    } else if (multi_block) {
+      lm(value ~ Block + Group, data = df)
     } else {
-      lm(value ~ Group + Block, data = df)
+      lm(value ~ Group, data = df)
     }
-  }, error = function(e) e, warning = function(w) w)
+  )
+  m <- fit$value
 
-  if (inherits(m, "error") || inherits(m, "warning")) {
-    return(list(pairwise = NULL, cld = NULL, error = conditionMessage(m)))
+  if (inherits(m, "error")) {
+    return(list(pairwise = NULL, cld = NULL, error = conditionMessage(m), warnings = fit$warnings))
   }
 
   res <- tryCatch({
@@ -151,7 +199,43 @@ run_posthoc <- function(df, block_effect = "fixed") {
     list(pairwise = pw, cld = emm_df, error = NULL)
   }, error = function(e) list(pairwise = NULL, cld = NULL, error = conditionMessage(e)))
 
+  res$warnings <- fit$warnings
   res
+}
+
+# 檢查設計是否「區集與處理正交」：每個 Block 內四個 Salt×Microbe 組合的樣本數都相同。
+# 成立時循序 (Type I) 平方和不受項目順序影響；不成立（例如稀疏化排除了樣本）時，
+# lm 的 anova() 與 PERMANOVA by="terms" 結果會依項目順序而變，需謹慎解讀。
+is_balanced_design <- function(meta) {
+  tab <- table(droplevels(factor(meta$Block)), interaction(meta$Salt, meta$Microbe, drop = FALSE))
+  all(tab > 0) && all(apply(tab, 1, function(r) length(unique(r)) == 1))
+}
+
+# 把分類單元名稱轉成 plotmath 運算式：屬名、種小名以斜體呈現，
+# 但 sp. / spp. / cf. / aff. / subsp. 等縮寫、Unclassified / Other / uncultured 等非學名字詞，
+# 以及含數字的非正式類群代號 (例如 SH-PL14、67-14) 維持正體。
+# 「Candidatus」依命名慣例：Candidatus 本身斜體、其後名稱正體。
+ROMAN_WORDS <- c("sp.", "sp", "spp.", "spp", "cf.", "aff.", "subsp.", "var.", "nov.", "gen.",
+                 "Unclassified", "unclassified", "Other", "uncultured", "unidentified",
+                 "metagenome", "bacterium", "group", "clade", "Incertae", "Sedis", "Candidatus")
+format_taxon_labels <- function(taxa) {
+  quote_str <- function(x) paste0("\"", gsub("([\"\\\\])", "\\\\\\1", x), "\"")
+  exprs <- vapply(as.character(taxa), function(lbl) {
+    words <- strsplit(lbl, "\\s+")[[1]]
+    words <- words[words != ""]
+    if (length(words) == 0) return(quote_str(lbl))
+    is_italic <- !(words %in% ROMAN_WORDS) &
+      grepl("^\\[?[A-Za-z][a-z]+\\]?(-[A-Za-z][a-z]+)*$", words)
+    cand <- which(words == "Candidatus")
+    if (length(cand) > 0) {
+      is_italic[cand] <- TRUE
+      after <- seq_along(words) > min(cand)
+      is_italic[after] <- FALSE
+    }
+    parts <- ifelse(is_italic, paste0("italic(", quote_str(words), ")"), quote_str(words))
+    paste(parts, collapse = "~")
+  }, character(1))
+  parse(text = exprs)
 }
 
 # 無母數 Scheirer-Ray-Hare 二因子檢定 (Salt x Microbe)
@@ -213,6 +297,9 @@ ui <- fluidPage(
       numericInput("rarefy_seed", "亂數種子 (seed)：", 1234),
       hr(),
       h4("③ 統計分析設定"),
+      textInput("block_map", "Block 對應 (Rep 編號，Block 之間以分號分隔)：", value = "1,2;3"),
+      helpText("例：「1,2;3」代表 R1、R2 屬 Block1，R3 屬 Block2；「1,2;3,4」代表 R1–R2 屬 Block1，R3–R4 屬 Block2。",
+               "資料中出現未指定的 Rep 編號時會停止分析並提示，不會默默歸入某個 Block。"),
       checkboxInput("aggregate_rep", "統計檢定 (LMM/SRH/PERMANOVA) 先將 A/B 子樣本平均為 Rep 層級 (n=12，建議勾選，避免假重複)", TRUE),
       checkboxInput("beta_show_all_points", "Beta 排序圖 (PCoA/NMDS) 顯示所有子樣本點 (n=24)，而非只顯示 Rep 平均點", TRUE),
       radioButtons("block_effect", "LMM 中 Block 的處理方式：",
@@ -220,7 +307,9 @@ ui <- fluidPage(
                                "隨機效應 (1|Block)（適合 Block 層級數多，如 ≥5 組）" = "random"),
                    selected = "fixed"),
       radioButtons("beta_metric", "Beta 多樣性距離：",
-                   choices = c("Bray-Curtis" = "bray", "Jaccard" = "jaccard")),
+                   choices = c("Bray-Curtis（豐度）" = "bray", "Jaccard（有/無）" = "jaccard")),
+      helpText("Jaccard 以有/無 (presence/absence) 計算；若勾選 Rep 層級平均，",
+               "A/B 子樣本任一個有出現即視為該 Rep 有出現。"),
       numericInput("permanova_perm", "PERMANOVA 排列次數：", 999, min = 99),
       radioButtons("permanova_by", "PERMANOVA 平方和拆解方式：",
                    choices = c("Terms（建議：本設計為平衡正交設計，會列出所有主效果+交互作用）" = "terms",
@@ -228,7 +317,9 @@ ui <- fluidPage(
                    selected = "terms"),
       helpText("提醒：adonis2 的 by=\"margin\" 在模型含交互作用時，只檢定交互作用本身，",
                "不會列出 Salt/Microbe 主效果（vegan 的既定行為，非錯誤）。",
-               "本設計為平衡 2×2 因子設計，用 by=\"terms\" 即可得到與邊際檢定一致、且完整的主效果+交互作用結果。"),
+               "模型為 距離 ~ Block + Salt * Microbe，並限制只在同一 Block 內排列。",
+               "只有在每個 Block 內四組樣本數都相同（平衡設計）時，by=\"terms\" 的結果才與項目順序無關；",
+               "若稀疏化排除了樣本造成不平衡，結果頁會顯示警告。"),
       hr(),
       actionButton("run_analysis", "④ 執行分析", class = "btn-primary", width = "100%")
     ),
@@ -256,15 +347,19 @@ ui <- fluidPage(
                  plotOutput("alpha_interaction", height = "500px"),
                  downloadButton("dl_alpha_inter", "下載交互作用圖 (.png)"),
                  hr(),
-                 h4("RCBD LMM 結果 (value ~ Salt * Microbe + (1|Block))"),
+                 uiOutput("lmm_title"),
+                 uiOutput("alpha_balance_msg"),
                  tableOutput("lmm_anova"),
                  downloadButton("dl_lmm_anova", "下載 LMM ANOVA 表 (.csv)"),
+                 uiOutput("lmm_warning_msg"),
                  h4("Tukey 事後比較 (Salt × Microbe，四組)"),
                  tableOutput("posthoc_table"),
                  downloadButton("dl_posthoc", "下載 Tukey 事後比較表 (.csv)"),
                  uiOutput("posthoc_error_msg"),
                  hr(),
                  h4("無母數檢定 Scheirer-Ray-Hare (穩健性檢驗)"),
+                 helpText("注意：採 Rep 層級平均時每組僅 n=3，SRH 與 Dunn's Test 的檢定力很低，",
+                          "不顯著不代表沒有差異，建議以 LMM 結果為主、無母數結果作為輔助。"),
                  tableOutput("srh_table"),
                  downloadButton("dl_srh", "下載無母數檢定表 (.csv)"),
                  hr(),
@@ -291,6 +386,7 @@ ui <- fluidPage(
                  tableOutput("permanova_table"),
                  downloadButton("dl_permanova", "下載 PERMANOVA 表 (.csv)"),
                  uiOutput("permanova_by_caption"),
+                 uiOutput("beta_balance_msg"),
                  h4("組間離散度同質性檢定 (betadisper + permutest)"),
                  tableOutput("betadisper_table"),
                  downloadButton("dl_betadisper", "下載 betadisper 表 (.csv)")
@@ -335,10 +431,15 @@ server <- function(input, output, session) {
   raw <- reactiveValues(tax = NULL, counts = NULL, meta = NULL)
   filt <- reactiveValues(tax = NULL, counts = NULL, summary = NULL)
   rare <- reactiveValues(comm = NULL, depth = NULL)
-  alpha <- reactiveValues(table = NULL, stat_df = NULL, lmm = NULL, posthoc = NULL, posthoc_errors = NULL,
-                          srh = NULL, dunn = NULL, dunn_errors = NULL)
-  beta <- reactiveValues(dist = NULL, pcoa = NULL, nmds = NULL, permanova = NULL, disper = NULL,
-                          comm_rel = NULL, meta_used = NULL, meta_plot = NULL, n_plot = NULL, n_stats = NULL)
+  # block_effect / metric / by 記錄「執行分析當下」的設定，讓標題與結果一致，
+  # 不會因為事後切換側欄選項（但未重新執行分析）而顯示錯誤的標示
+  alpha <- reactiveValues(table = NULL, stat_df = NULL, lmm = NULL, lmm_notes = NULL,
+                          posthoc = NULL, posthoc_errors = NULL,
+                          srh = NULL, dunn = NULL, dunn_errors = NULL,
+                          block_effect = NULL, multi_block = NULL, balanced = NULL)
+  beta <- reactiveValues(dist = NULL, pcoa = NULL, nmds = NULL, permanova = NULL, permanova_error = NULL,
+                          disper = NULL, comm_rel = NULL, meta_used = NULL, meta_plot = NULL,
+                          n_plot = NULL, n_stats = NULL, metric = NULL, by = NULL, balanced = NULL)
 
   observeEvent(input$run_analysis, {
     req(input$asv_csv)
@@ -356,11 +457,22 @@ server <- function(input, output, session) {
         validate(need(length(sample_cols) >= 2, "至少需要 2 個樣本欄位才能進行多樣性分析。"))
 
         tax_df <- df[, TAX_COLS, drop = FALSE]
-        counts_mat <- as.matrix(df[, sample_cols, drop = FALSE])
-        rownames(counts_mat) <- df$OTU_ID
-        storage.mode(counts_mat) <- "numeric"
 
-        meta <- parse_sample_metadata(sample_cols)
+        # 樣本欄位必須全為非負數值；在轉型前先檢查，避免非數值被默默轉成 NA、到稀疏化才出現難懂的錯誤
+        bad_cols <- sample_cols[vapply(sample_cols, function(col) {
+          x <- df[[col]]
+          num <- suppressWarnings(as.numeric(as.character(x)))
+          any(is.na(num)) || any(num < 0)
+        }, logical(1))]
+        validate(need(length(bad_cols) == 0,
+                      paste0("以下樣本欄位含有空值、非數值或負值，請檢查 CSV（例如是否混入文字欄位或空白格）：",
+                             paste(bad_cols, collapse = ", "))))
+
+        counts_mat <- vapply(df[, sample_cols, drop = FALSE], function(x) as.numeric(as.character(x)),
+                             numeric(nrow(df)))
+        counts_mat <- matrix(counts_mat, nrow = nrow(df), dimnames = list(df$OTU_ID, sample_cols))
+
+        meta <- parse_sample_metadata(sample_cols, parse_block_map(input$block_map))
         raw$tax <- tax_df; raw$counts <- counts_mat; raw$meta <- meta
 
         # ---- 2. 過濾 ----
@@ -414,19 +526,27 @@ server <- function(input, output, session) {
           stat_df <- long_alpha %>% dplyr::select(Index, Treatment, RepNum, Block, Salt, Microbe, value)
         }
         alpha$stat_df <- stat_df
+        stat_design <- stat_df %>% dplyr::filter(Index == idx_cols[1])
+        alpha$balanced <- is_balanced_design(stat_design)
+        alpha$multi_block <- has_multi_block(stat_design)
+        alpha$block_effect <- input$block_effect
 
         # ---- 5. LMM + 事後檢定 + 無母數檢定 (逐指數) ----
         incProgress(0.65, detail = "執行 LMM 與事後檢定...")
         lmm_list <- list(); posthoc_list <- list(); srh_list <- list(); posthoc_errors <- list()
-        dunn_list <- list(); dunn_errors <- list()
+        dunn_list <- list(); dunn_errors <- list(); lmm_notes <- list()
         for (idx in idx_cols) {
           sub <- stat_df %>% dplyr::filter(Index == idx)
           lm_res <- run_lmm(sub, block_effect = input$block_effect)
           lmm_list[[idx]] <- lm_res$anova
+          notes <- c(if (!is.null(lm_res$error)) paste0("模型配適失敗：", lm_res$error),
+                     lm_res$warnings)
+          if (length(notes) > 0) lmm_notes[[idx]] <- notes
 
           ph <- run_posthoc(sub, block_effect = input$block_effect)
           posthoc_list[[idx]] <- ph$cld
-          if (!is.null(ph$error)) posthoc_errors[[idx]] <- ph$error
+          ph_msgs <- c(ph$error, if (length(ph$warnings) > 0) paste0("（警告）", ph$warnings))
+          if (length(ph_msgs) > 0) posthoc_errors[[idx]] <- paste(ph_msgs, collapse = "；")
 
           srh_list[[idx]] <- run_srh(sub)
 
@@ -435,6 +555,7 @@ server <- function(input, output, session) {
           if (!is.null(dn$error)) dunn_errors[[idx]] <- dn$error
         }
         alpha$lmm <- lmm_list
+        alpha$lmm_notes <- lmm_notes
         alpha$posthoc <- posthoc_list
         alpha$posthoc_errors <- posthoc_errors
         alpha$srh <- srh_list
@@ -466,7 +587,12 @@ server <- function(input, output, session) {
         beta$comm_rel <- comm_for_stats
         beta$meta_used <- meta_for_stats
 
-        d_stats <- vegdist(comm_for_stats, method = input$beta_metric)
+        # Jaccard 採有/無 (binary = TRUE)，即一般文獻所指的 Jaccard；Bray-Curtis 維持豐度加權
+        use_binary <- input$beta_metric == "jaccard"
+        beta$metric <- input$beta_metric
+        beta$by <- input$permanova_by
+
+        d_stats <- vegdist(comm_for_stats, method = input$beta_metric, binary = use_binary)
         beta$dist <- d_stats
 
         # 排序圖用矩陣：可獨立於統計檢定，選擇呈現全部子樣本點 (n=24) 或跟統計一致的 Rep 平均點
@@ -481,7 +607,7 @@ server <- function(input, output, session) {
         beta$n_plot <- nrow(comm_for_plot)
         beta$n_stats <- nrow(comm_for_stats)
 
-        d_plot <- vegdist(comm_for_plot, method = input$beta_metric)
+        d_plot <- vegdist(comm_for_plot, method = input$beta_metric, binary = use_binary)
 
         pcoa <- cmdscale(d_plot, k = 2, eig = TRUE)
         beta$pcoa <- pcoa
@@ -489,18 +615,32 @@ server <- function(input, output, session) {
         nmds <- tryCatch(metaMDS(d_plot, k = 2, trymax = 100, trace = FALSE), error = function(e) NULL)
         beta$nmds <- nmds
 
-        perm_formula <- as.formula("d_stats ~ Salt * Microbe")
+        # Block 同時放進模型（先扣除區集變異）並限制排列只在同一 Block 內進行 (permute::how(blocks = ...))。
+        # 原本只用 strata 限制排列、Block 未進入模型，區集造成的變異會留在殘差中，與 Alpha 的 LMM 不一致。
+        meta_for_stats$Block <- droplevels(factor(meta_for_stats$Block))
+        multi_block_beta <- nlevels(meta_for_stats$Block) > 1
+        beta$balanced <- is_balanced_design(meta_for_stats)
+        perm_ctrl <- if (multi_block_beta) {
+          permute::how(nperm = input$permanova_perm, blocks = meta_for_stats$Block)
+        } else {
+          permute::how(nperm = input$permanova_perm)
+        }
+        perm_formula <- as.formula(if (multi_block_beta) "d_stats ~ Block + Salt * Microbe" else "d_stats ~ Salt * Microbe")
         permanova <- tryCatch(
-          adonis2(perm_formula, data = meta_for_stats, permutations = input$permanova_perm,
-                  by = input$permanova_by,
-                  strata = if (nlevels(meta_for_stats$Block) > 1) meta_for_stats$Block else NULL),
-          error = function(e) NULL
+          adonis2(perm_formula, data = meta_for_stats, permutations = perm_ctrl, by = input$permanova_by),
+          error = function(e) e
         )
+        if (inherits(permanova, "error")) {
+          beta$permanova_error <- conditionMessage(permanova)
+          permanova <- NULL
+        } else {
+          beta$permanova_error <- NULL
+        }
         beta$permanova <- permanova
 
         disper <- tryCatch({
           bd <- betadisper(d_stats, meta_for_stats$Treatment)
-          pt <- permutest(bd, permutations = input$permanova_perm)
+          pt <- permutest(bd, permutations = perm_ctrl)
           as.data.frame(pt$tab)
         }, error = function(e) NULL)
         beta$disper <- disper
@@ -522,10 +662,15 @@ server <- function(input, output, session) {
     content = function(file) { req(filt$summary); readr::write_excel_csv(filt$summary, file) }
   )
 
+  # 使用「過濾後」的資料（與後續分析一致），步長依最大樣本深度自動調整為每條曲線約 200 點，
+  # 並以紅色虛線標示實際採用的稀疏化深度
   output$rarecurve_plot <- renderPlot({
-    req(raw$counts)
-    comm <- t(raw$counts)
-    rarecurve(comm, step = 200, label = FALSE, col = "steelblue")
+    req(filt$counts, rare$depth)
+    comm <- t(filt$counts)
+    step <- max(1, floor(max(rowSums(comm)) / 200))
+    rarecurve(comm, step = step, label = FALSE, col = "steelblue", sample = rare$depth,
+              xlab = "讀序數 (reads)", ylab = "ASV 數")
+    title(sub = paste0("紅色虛線：稀疏化深度 = ", format(rare$depth, big.mark = ",")))
   })
 
   # ---- Alpha 多樣性 ----
@@ -610,6 +755,47 @@ server <- function(input, output, session) {
     content = function(file) ggsave(file, make_interaction_plot(), width = 10, height = 7, dpi = 300)
   )
 
+  output$lmm_title <- renderUI({
+    req(alpha$block_effect)
+    formula_txt <- if (!isTRUE(alpha$multi_block)) {
+      "value ~ Salt * Microbe（僅 1 個 Block，未納入區集項）"
+    } else if (alpha$block_effect == "random") {
+      "value ~ Salt * Microbe + (1|Block)，lmerTest Type III"
+    } else {
+      "value ~ Block + Salt * Microbe，lm 循序 (Type I) 平方和"
+    }
+    h4(paste0("RCBD 模型結果 (", formula_txt, ")"))
+  })
+
+  balance_warning <- function(balanced, what) {
+    if (is.null(balanced) || isTRUE(balanced)) return(NULL)
+    div(style = "color:#b06000; margin:6px 0;",
+        tags$strong("⚠ 設計不平衡："),
+        paste0("各 Block 內四個處理組的樣本數不一致（可能是稀疏化排除了樣本）。",
+               what, "的循序 (Type I) 平方和會受項目順序影響，解讀主效果時請謹慎。"))
+  }
+  output$alpha_balance_msg <- renderUI({
+    req(alpha$block_effect)
+    if (alpha$block_effect == "random") return(NULL)  # lmerTest 預設為 Type III，不受順序影響
+    balance_warning(alpha$balanced, "lm ANOVA ")
+  })
+  output$beta_balance_msg <- renderUI({
+    req(beta$by)
+    if (beta$by == "margin") return(NULL)
+    balance_warning(beta$balanced, "PERMANOVA by=\"terms\" ")
+  })
+
+  output$lmm_warning_msg <- renderUI({
+    req(alpha$lmm_notes)
+    if (length(alpha$lmm_notes) == 0) return(NULL)
+    msgs <- lapply(names(alpha$lmm_notes), function(idx) {
+      tags$li(paste0(idx, "：", paste(alpha$lmm_notes[[idx]], collapse = "；")))
+    })
+    div(style = "color:#b06000;",
+        tags$strong("⚠ 以下指數的模型配適出現警告（結果仍列於上表，請留意）："),
+        tags$ul(msgs))
+  })
+
   lmm_anova_df <- reactive({
     req(alpha$lmm)
     dplyr::bind_rows(lapply(names(alpha$lmm), function(idx) {
@@ -650,7 +836,7 @@ server <- function(input, output, session) {
       tags$li(paste0(idx, "：", alpha$posthoc_errors[[idx]]))
     })
     div(style = "color:#b06000;",
-        tags$strong("⚠ 以下指數的事後比較未能完成："),
+        tags$strong("⚠ 以下指數的事後比較出現錯誤或警告："),
         tags$ul(msgs))
   })
 
@@ -706,6 +892,23 @@ server <- function(input, output, session) {
                 beta$n_plot, beta$n_stats))
   })
 
+  metric_label <- function() {
+    if (identical(beta$metric, "jaccard")) "Jaccard, presence/absence" else "Bray-Curtis"
+  }
+
+  # 排序圖共用的點、信賴橢圓與配色。每組少於 4 點時橢圓估計極不穩定（Rep 平均時每組僅 3 點），
+  # 因此只對 ≥4 點的組別畫橢圓，並在圖說註明
+  ordination_layers <- function(pts) {
+    ell_pts <- pts %>% dplyr::group_by(Treatment) %>% dplyr::filter(dplyr::n() >= 4) %>% dplyr::ungroup()
+    list(
+      geom_point(size = 4, alpha = 0.85),
+      if (nrow(ell_pts) > 0) stat_ellipse(data = ell_pts, aes(group = Treatment, shape = NULL), level = 0.68, linetype = 2),
+      scale_color_manual(values = c(Ct = "#8DA0CB", CtP = "#66C2A5", Na = "#FC8D62", NaP = "#E78AC3")),
+      theme_bw(base_size = 13),
+      labs(caption = if (nrow(ell_pts) < nrow(pts)) "部分組別點數 < 4，未繪製 68% 信賴橢圓" else "虛線：68% 信賴橢圓")
+    )
+  }
+
   make_pcoa_plot <- function() {
     req(beta$pcoa)
     pcoa <- beta$pcoa
@@ -714,12 +917,9 @@ server <- function(input, output, session) {
     pts$SampleID <- rownames(pts)
     pts <- left_join(pts, beta$meta_plot, by = "SampleID")
     ggplot(pts, aes(PCoA1, PCoA2, color = Treatment, shape = Block)) +
-      geom_point(size = 4, alpha = 0.85) +
-      stat_ellipse(aes(group = Treatment), level = 0.68, linetype = 2) +
-      scale_color_manual(values = c(Ct = "#8DA0CB", CtP = "#66C2A5", Na = "#FC8D62", NaP = "#E78AC3")) +
-      theme_bw(base_size = 13) +
+      ordination_layers(pts) +
       labs(x = paste0("PCoA1 (", var_exp[1], "%)"), y = paste0("PCoA2 (", var_exp[2], "%)"),
-           title = paste0("PCoA (", toupper(input$beta_metric), "), n = ", beta$n_plot))
+           title = paste0("PCoA (", metric_label(), "), n = ", beta$n_plot))
   }
   output$pcoa_plot <- renderPlot({ make_pcoa_plot() })
   output$dl_pcoa <- downloadHandler(
@@ -733,11 +933,8 @@ server <- function(input, output, session) {
     pts$SampleID <- rownames(pts)
     pts <- left_join(pts, beta$meta_plot, by = "SampleID")
     ggplot(pts, aes(NMDS1, NMDS2, color = Treatment, shape = Block)) +
-      geom_point(size = 4, alpha = 0.85) +
-      stat_ellipse(aes(group = Treatment), level = 0.68, linetype = 2) +
-      scale_color_manual(values = c(Ct = "#8DA0CB", CtP = "#66C2A5", Na = "#FC8D62", NaP = "#E78AC3")) +
-      theme_bw(base_size = 13) +
-      labs(title = paste0("NMDS (", toupper(input$beta_metric), "), stress = ", round(beta$nmds$stress, 3),
+      ordination_layers(pts) +
+      labs(title = paste0("NMDS (", metric_label(), "), stress = ", round(beta$nmds$stress, 3),
                            ", n = ", beta$n_plot))
   }
   output$nmds_plot <- renderPlot({ make_nmds_plot() })
@@ -759,9 +956,17 @@ server <- function(input, output, session) {
   )
 
   output$permanova_by_caption <- renderUI({
-    req(input$permanova_by)
-    lbl <- if (input$permanova_by == "margin") "Margin（邊際效果）" else "Terms（循序型 Type I）"
-    div(style = "color:#555; font-size:90%;", paste0("平方和拆解方式：", lbl))
+    req(beta$by)
+    lbl <- if (beta$by == "margin") "Margin（邊際效果）" else "Terms（循序型 Type I）"
+    err <- if (!is.null(beta$permanova_error)) {
+      div(style = "color:#b06000;", paste0("⚠ PERMANOVA 執行失敗：", beta$permanova_error))
+    }
+    tagList(
+      div(style = "color:#555; font-size:90%;",
+          paste0("距離：", metric_label(), "｜平方和拆解方式：", lbl,
+                 "｜排列限制在同一 Block 內 (permute::how(blocks = Block))")),
+      err
+    )
   })
 
   betadisper_df <- reactive({
@@ -844,10 +1049,15 @@ server <- function(input, output, session) {
                                         max(1, round(input$comp_top_n)), "大 + 其他）"))
     }
 
+    # 屬 (Genus) / 種 (Species) 階層的圖例以斜體呈現學名，sp. 等縮寫維持正體
+    fill_labels <- if (input$tax_level %in% c("Genus", "Species")) format_taxon_labels else ggplot2::waiver()
+
     p + geom_bar(stat = "identity", position = "stack") +
       theme_bw(base_size = 13) +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.text = element_text(hjust = 0)) +
       scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.02))) +
+      scale_fill_discrete(labels = fill_labels) +
       labs(y = "平均相對豐度 (%)", fill = input$tax_level)
   }
   output$composition_plot <- renderPlot({ make_composition_plot() })

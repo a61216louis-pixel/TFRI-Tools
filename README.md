@@ -19,7 +19,8 @@ install.packages(c("shiny","tidyverse","car","rstatix","multcompView",
                     "ggpubr","agricolae","multcomp","corrplot","vegan",
                     "mice","lme4","lmerTest","emmeans","effectsize",
                     "patchwork","MuMIn","nlme","ggrepel","showtext",
-                    "knitr","kableExtra","plotly","sortable","zip"))
+                    "knitr","kableExtra","plotly","sortable","zip",
+                    "rcompanion","FSA","DT","permute"))
 # pairwiseAdonis 需另從 GitHub 安裝:
 # remotes::install_github("pmartinezarbizu/pairwiseAdonis")
 ```
@@ -39,7 +40,8 @@ TFRI-Tools/
 │   ├── invitation_gui.py
 │   └── stamp_gui.py
 └── statistics/           統計分析工具 (R Shiny)
-    └── Factorial_research_3factor.R
+    ├── Factorial_research_3factor.R
+    └── Microbiome_Diversity_Shiny.R
 ```
 
 ## 工具說明
@@ -67,6 +69,7 @@ TFRI-Tools/
 | 工具 | 用途 | 執行方式 |
 |---|---|---|
 | `Factorial_research_3factor.R` | 三因子田間試驗統計分析平台。支援 RCBD 區集設計,ANOVA / LMM(混合模型)雙軌分析並依殘差診斷自動切換,Tukey / LSD / Dunn 事後檢定與 CLD 分組字母標示;提供 η² 效應量、R²m/R²c、縱貫分析(含 AR(1) 自相關結構)、森林圖(forest plot)、3D 互動圖(plotly),分析結果可批次匯出 PNG/CSV(UTF-8 BOM,Excel 中文顯示正常) | 於 R/RStudio 中開啟後執行 `shiny::runApp("Factorial_research_3factor.R")`,或直接開檔按「Run App」 |
+| `Microbiome_Diversity_Shiny.R` | 根系微生物相 (ASV) 多樣性分析平台（Salt × Microbe 2×2 因子 RCBD）。葉綠體/粒線體與豐富度/普遍率過濾、稀疏化；Alpha 多樣性（Observed/Shannon/Simpson/Pielou/Chao1）搭配 LM/LMM、Tukey 字母標示、Scheirer-Ray-Hare 與 Dunn's test；Beta 多樣性 PCoA/NMDS、PERMANOVA（Block 納入模型並限制區集內排列）與 betadisper；物種組成堆疊圖（屬名/種小名自動斜體，sp. 維持正體） | `shiny::runApp("Microbiome_Diversity_Shiny.R")` |
 
 ## 注意事項
 
