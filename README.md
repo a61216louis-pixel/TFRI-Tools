@@ -37,7 +37,8 @@ TFRI-Tools/
 │   ├── 三摺桌牌.py
 │   ├── 對摺桌牌.py
 │   ├── invitation_gui.py
-│   └── stamp_gui.py
+│   ├── stamp_gui.py
+│   └── html_publisher_gui.py
 └── statistics/           統計分析工具 (R Shiny)
     └── Factorial_research_3factor.R
 ```
@@ -61,6 +62,7 @@ TFRI-Tools/
 | `對摺桌牌.py` | 對摺式桌牌產生器 | `python 對摺桌牌.py` |
 | `invitation_gui.py` | 活動邀請函批次產生與寄送(PDF 產生 + Gmail SMTP 群發) | `python invitation_gui.py` |
 | `stamp_gui.py` | 電子印章產生器,輸入姓名可產生長方橫式章與標楷體正方章 | `python stamp_gui.py` |
+| `html_publisher_gui.py` | HTML 網頁發布工具:選擇 .html 檔上傳至 GitHub Pages,產生公開網址與 QR Code;同代稱再次發布即更新內容、網址不變,並可列出/下架已發布網頁 | `python html_publisher_gui.py` |
 
 ### 統計分析工具 (R Shiny)
 
@@ -72,6 +74,7 @@ TFRI-Tools/
 
 - `stamp_gui.py` 預設搜尋 Windows 系統字型路徑(標楷體、微軟正黑體),在非 Windows 系統執行時需自行指定字型檔,或於程式啟動時依提示手動選擇字型檔。
 - `invitation_gui.py` 若涉及 Gmail SMTP 寄送,需自行設定應用程式密碼,請勿將帳密寫死於程式碼或一併提交至倉庫。
+- `html_publisher_gui.py` 需 GitHub Personal Access Token(classic,勾選 `repo` 權限),程式內「Token 怎麼申請?」按鈕有步驟說明。免費帳號的 GitHub Pages 須使用**公開**儲存庫,發布的網頁任何人取得網址即可瀏覽,請勿發布含個資或未公開資料的 HTML。選用套件 `pip install qrcode pillow` 可顯示/另存 QR Code。
 - `TFRI人員爬蟲_GUI.py` 僅供內部行政用途,爬取結果(如輸出的 Excel 檔)請勿提交至倉庫。
 - `Factorial_research_3factor.R` 內建 `label_map` 為使用者自訂欄位中英文對照表,預設為空,使用前建議依實際資料欄位名稱填入,否則系統會自動嘗試從欄位名稱解析顯示名稱與單位。
 - 統計分析用的原始資料(CSV/Excel 實驗數據)請勿提交至倉庫,避免未發表數據外流;僅上傳分析程式碼本身。
